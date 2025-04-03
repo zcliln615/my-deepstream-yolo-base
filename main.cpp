@@ -1,18 +1,25 @@
 #include <nvdsgstutils.h>
 #include <cuda_runtime_api.h>
-#include "gstnvdsmeta.h"
+#include <gstnvdsmeta.h>
 #include <glib.h>
 #include <iostream>
+#include <string>
+#include <fstream>
+#include <iomanip>
+#include <chrono>
+#include <sstream>
+#include <ctime>
+
 #include "perf.h"
 
-#define VIDEO_PATH "/home/lin/DeepStream-Yolo-Pose/ikun.mp4"
+#define VIDEO_PATH "/home/lin/DeepStream-Yolo-Pose/bodypose.mp4"
 #define CONFIG_FILE_PATH "/home/lin/DeepStream-Yolo-Pose/config_infer_primary_yoloV8_pose.txt"
 
 #define PERF_MEASUREMENT_INTERVAL_SEC 2 // 性能测量间隔时间
 #define SET_WIDTH 1920
 #define SET_HEIGHT 1080
-#define DISPLAY_SINK "fakesink"
-
+#define STREAMMUX_TIMEOUT 16000
+#define DISPLAY_SINK "filesink"
 
 const gint skeleton[][2] = {{16, 14}, {14, 12}, {17, 15}, {15, 13}, {12, 13}, {6, 12}, {7, 13}, {6, 7}, {6, 8}, {7, 9}, {8, 10}, {9, 11}, {2, 3}, {1, 2}, {1, 3}, {2, 4}, {3, 5}, {4, 6}, {5, 7}};
 
@@ -61,6 +68,26 @@ static gboolean key_event(GIOChannel *source, GIOCondition condition, gpointer d
     GMainLoop *loop = (GMainLoop *)data;
     g_main_loop_quit(loop);
     return TRUE;
+}
+
+// 时间命名函数
+std::string getCurrentTimeFilename(const char *file_format)
+{
+    // 获取当前时间点
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+
+    // 获取文件格式名
+    std::string file_format_name = file_format;
+
+    // 格式化时间
+    std::tm tm_info;
+    localtime_r(&now_time, &tm_info); // Linux/macOS
+
+    std::ostringstream oss;
+    oss << std::put_time(&tm_info, "%Y-%m-%d_%H-%M-%S");
+
+    return "pose" + oss.str() + file_format_name; // 生成文件名
 }
 
 // pad-added 回调函数实现
@@ -140,6 +167,8 @@ set_custom_bbox(NvDsObjectMeta *obj_meta)
 static void
 parse_pose_from_meta(NvDsFrameMeta *frame_meta, NvDsObjectMeta *obj_meta)
 {
+    // 定义静态变量，确保在多次调用函数时保持状态
+    static u_int64_t frame_id = 0;
     guint num_joints = obj_meta->mask_params.size / (sizeof(float) * 3);
 
     gfloat gain = MIN((gfloat)obj_meta->mask_params.width / SET_WIDTH,
@@ -226,8 +255,17 @@ parse_pose_from_meta(NvDsFrameMeta *frame_meta, NvDsObjectMeta *obj_meta)
 static GstPadProbeReturn
 tracker_src_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
 {
+    static int frame_count = 0;
     GstBuffer *buf = (GstBuffer *)info->data;
     NvDsBatchMeta *batch_meta = gst_buffer_get_nvds_batch_meta(buf);
+
+    // 一次性打开文件进行追加写入
+    std::string filename = *(std::string *)user_data;
+    std::ofstream file(filename, std::ios::app);
+    if (!file.is_open())
+    {
+        g_printerr("ERROR: Failed to open file %s for appending\n", filename.c_str());
+    }
 
     NvDsMetaList *l_frame = NULL;
     for (l_frame = batch_meta->frame_meta_list; l_frame != NULL; l_frame = l_frame->next)
@@ -239,10 +277,39 @@ tracker_src_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_d
         {
             NvDsObjectMeta *obj_meta = (NvDsObjectMeta *)(l_obj->data);
 
+            // 获取关键点
+            guint num_joints = obj_meta->mask_params.size / (sizeof(float) * 3);
+
+            gfloat gain = MIN((gfloat)obj_meta->mask_params.width / SET_WIDTH,
+                              (gfloat)obj_meta->mask_params.height / SET_HEIGHT);
+            gfloat pad_x = (obj_meta->mask_params.width - SET_WIDTH * gain) / 2.0;
+            gfloat pad_y = (obj_meta->mask_params.height - SET_HEIGHT * gain) / 2.0;
+            for (guint i = 0; i < num_joints; ++i)
+            {
+                gfloat xc = (obj_meta->mask_params.data[i * 3 + 0] - pad_x) / gain;
+                gfloat yc = (obj_meta->mask_params.data[i * 3 + 1] - pad_y) / gain;
+                gfloat confidence = obj_meta->mask_params.data[i * 3 + 2];
+
+                if (confidence < 0.5)
+                {
+                    continue;
+                }
+
+                // 写入文件
+                file << frame_count << "," << obj_meta->object_id << "," << i << "," << xc << "," << yc << "," << confidence << "\n";
+            }
+
+            // 绘制骨架和关键点
             parse_pose_from_meta(frame_meta, obj_meta);
             set_custom_bbox(obj_meta);
         }
     }
+
+    // 处理完一帧后增加帧计数
+    frame_count++;
+    // 关闭文件
+    file.close();
+
     return GST_PAD_PROBE_OK;
 }
 
@@ -251,6 +318,17 @@ int main(int argc, char *argv[])
     // 初始化管道
     gst_init(&argc, &argv);
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+
+    // 创建文件用于保存数据
+    std::string csv_filename = getCurrentTimeFilename(".csv");
+    std::string mp4_filename = getCurrentTimeFilename(".mp4");
+    // 写入表头
+    std::ofstream file(csv_filename);
+    if (file.is_open())
+    {
+        file << "Frame ID,Person ID,Keypoint ID,X,Y,Confidence\n";
+        file.close();
+    }
 
     // 管道
     GstElement *pipeline = gst_pipeline_new("test-pipeline");
@@ -294,7 +372,7 @@ int main(int argc, char *argv[])
                  "width", SET_WIDTH,
                  "height", SET_HEIGHT,
                  "batch-size", 1,
-                 "batched-push-timeout", 40000,
+                 "batched-push-timeout", STREAMMUX_TIMEOUT,
                  NULL);
 
     // nvinfer推理器
@@ -350,6 +428,34 @@ int main(int argc, char *argv[])
     // 设置绘制器的属性
     g_object_set(G_OBJECT(osd), "process-mode", MODE_GPU, "qos", 0, NULL);
 
+    // encoder编码器
+    // encoder用于将视频流编码为适合存储的格式
+    GstElement *encoder = gst_element_factory_make("nvv4l2h264enc", "h264-encoder");
+    if (!encoder)
+    {
+        g_printerr("Failed to create encoder element\n");
+        return -1;
+    }
+    // 设置编码器的属性
+    g_object_set(G_OBJECT(encoder), "bitrate", 4000000, "preset-level", 1, NULL);
+
+    // 添加 h264parse 解析器
+    GstElement *h264parse = gst_element_factory_make("h264parse", "h264-parser");
+    if (!h264parse)
+    {
+        g_printerr("Failed to create h264parse element\n");
+        return -1;
+    }
+
+    // mp4mux封装器
+    // mp4mux用于将编码后的视频流封装为MP4格式
+    GstElement *mp4mux = gst_element_factory_make("mp4mux", "mp4-muxer");
+    if (!mp4mux)
+    {
+        g_printerr("Failed to create mp4mux element\n");
+        return -1;
+    }
+
     // sink元素
     // sink元素用于将视频流输出到屏幕或文件
     GstElement *sink = gst_element_factory_make(DISPLAY_SINK, "nvvideo-renderer");
@@ -359,10 +465,13 @@ int main(int argc, char *argv[])
         return -1;
     }
     // 设置sink元素的属性
-    g_object_set(G_OBJECT(sink), "async", 0, "sync", 0, "qos", 0, NULL);
+    // // nv3dsink用于将视频流输出到屏幕
+    // g_object_set(G_OBJECT(sink), "async", 0, "sync", 0, "qos", 0, NULL);
+    // filesink用于将视频流输出到文件
+    g_object_set(G_OBJECT(sink), "location", mp4_filename.c_str(), NULL);
 
     // 将所有元素添加到管道中
-    gst_bin_add_many(GST_BIN(pipeline), source ,decoder, streammux, pgie, tracker, nvvidconv, osd, sink, NULL);
+    gst_bin_add_many(GST_BIN(pipeline), source, decoder, streammux, pgie, tracker, nvvidconv, osd, encoder, h264parse, mp4mux, sink, NULL);
 
     // 链接元素streammux前置元素
     if (!gst_element_link_many(source, decoder, NULL))
@@ -385,7 +494,7 @@ int main(int argc, char *argv[])
     g_signal_connect(decoder, "pad-added", G_CALLBACK(pad_added_handler), streammux);
 
     // 链接元素streammux和后续元素
-    if(!gst_element_link_many(streammux, pgie, tracker, nvvidconv, osd, sink, NULL))
+    if (!gst_element_link_many(streammux, pgie, tracker, nvvidconv, osd, encoder, h264parse, mp4mux, sink, NULL))
     {
         g_printerr("Failed to link streammux and other elements\n");
         return -1;
@@ -404,7 +513,7 @@ int main(int argc, char *argv[])
         return -1;
     }
     else
-        gst_pad_add_probe(tracker_src_pad, GST_PAD_PROBE_TYPE_BUFFER, tracker_src_pad_buffer_probe, NULL, NULL);
+        gst_pad_add_probe(tracker_src_pad, GST_PAD_PROBE_TYPE_BUFFER, tracker_src_pad_buffer_probe, &csv_filename, NULL);
     gst_object_unref(tracker_src_pad);
 
     // 添加性能监控器
@@ -421,8 +530,6 @@ int main(int argc, char *argv[])
         enable_perf_measurement(perf_struct, converter_sink_pad, 1, PERF_MEASUREMENT_INTERVAL_SEC, 0, perf_cb);
     }
     gst_object_unref(converter_sink_pad);
-
-
 
     // 启动管道
     gst_element_set_state(pipeline, GST_STATE_PAUSED);
@@ -443,11 +550,11 @@ int main(int argc, char *argv[])
     g_main_loop_run(loop);
 
     // 停止管道并释放资源
+
     g_print("Stopping...\n");
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(pipeline);
     g_main_loop_unref(loop);
-    
 
     return 0;
 }
