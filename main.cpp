@@ -10,6 +10,8 @@
 #include <sstream>
 #include <ctime>
 
+
+
 #include "perf.h"
 
 #define VIDEO_PATH "/home/lin/DeepStream-Yolo-Pose/bodypose.mp4"
@@ -19,7 +21,8 @@
 #define SET_WIDTH 1920
 #define SET_HEIGHT 1080
 #define STREAMMUX_TIMEOUT 16000
-#define DISPLAY_SINK "filesink"
+#define CAPTURE_MODE 1    // 1: 文件读取视频；0: 摄像头读取视频
+#define VIDEO_SAVE_MODE 1 // 0: 不保存视频,实时演示；1: 保存视频，不实时演示
 
 const gint skeleton[][2] = {{16, 14}, {14, 12}, {17, 15}, {15, 13}, {12, 13}, {6, 12}, {7, 13}, {6, 7}, {6, 8}, {7, 9}, {8, 10}, {9, 11}, {2, 3}, {1, 2}, {1, 3}, {2, 4}, {3, 5}, {4, 6}, {5, 7}};
 
@@ -31,7 +34,15 @@ bus_call(GstBus *bus, GstMessage *msg, gpointer user_data)
     {
     case GST_MESSAGE_EOS:
     {
-        g_print("DEBUG: EOS\n");
+        g_print("Received EOS event...\n");
+        g_print("Waiting for pipeline to finish processing...\n");
+
+        // 确保所有数据都被处理完
+        GstState state;
+        GstState pending;
+        gst_element_get_state(GST_ELEMENT(GST_MESSAGE_SRC(msg)), &state, &pending, GST_CLOCK_TIME_NONE);
+
+        g_print("Pipeline processing complete. Exiting...\n");
         g_main_loop_quit(loop);
         break;
     }
@@ -167,8 +178,7 @@ set_custom_bbox(NvDsObjectMeta *obj_meta)
 static void
 parse_pose_from_meta(NvDsFrameMeta *frame_meta, NvDsObjectMeta *obj_meta)
 {
-    // 定义静态变量，确保在多次调用函数时保持状态
-    static u_int64_t frame_id = 0;
+
     guint num_joints = obj_meta->mask_params.size / (sizeof(float) * 3);
 
     gfloat gain = MIN((gfloat)obj_meta->mask_params.width / SET_WIDTH,
@@ -321,7 +331,6 @@ int main(int argc, char *argv[])
 
     // 创建文件用于保存数据
     std::string csv_filename = getCurrentTimeFilename(".csv");
-    std::string mp4_filename = getCurrentTimeFilename(".mp4");
     // 写入表头
     std::ofstream file(csv_filename);
     if (file.is_open())
@@ -337,7 +346,7 @@ int main(int argc, char *argv[])
         g_printerr("Failed to create pipeline\n");
         return -1;
     }
-
+#if CAPTURE_MODE
     // 创建管道元素
     // filesrc读取文件
     GstElement *source = gst_element_factory_make("filesrc", "file-source");
@@ -357,6 +366,39 @@ int main(int argc, char *argv[])
         g_printerr("Failed to create decoder element\n");
         return -1;
     }
+#else
+    // 创建管道元素
+    // v4l2src读取摄像头
+    GstElement *source = gst_element_factory_make("v4l2src", "camera-source");
+    if (!source)
+    {
+        g_printerr("Failed to create source element\n");
+        return -1;
+    }
+
+    // 设置摄像头路径
+    g_object_set(G_OBJECT(source), "device", "/dev/video0", NULL);
+
+    // 设置摄像头参数
+    GstElement *v4l2caps = gst_element_factory_make("capsfilter", "v4l2capsfilter");
+
+    // 修改caps为摄像头原生RG10格式
+    GstCaps *caps = gst_caps_new_simple("video/x-bayer",
+                                         "format", G_TYPE_STRING, "rgrg",
+                                         "width", G_TYPE_INT, 1920,
+                                         "height", G_TYPE_INT, 1080,
+                                         "framerate", GST_TYPE_FRACTION, 30, 1,
+                                         NULL);
+    g_object_set(G_OBJECT(v4l2caps), "caps", caps, NULL);
+    gst_caps_unref(caps);
+
+    // 添加RG10到RGB转换器
+    GstElement *v4l2bayerconv = gst_element_factory_make("bayer2rgb", "v4l2bayerconv");
+
+    // 添加nvvidconv转换器
+    GstElement *v4l2nvvidconv = gst_element_factory_make("nvvidconv", "v4l2nvvidconv");
+
+#endif
 
     // nvstreammux流复用器
     // 流复用器用于将多个视频流合并为一个流
@@ -428,6 +470,46 @@ int main(int argc, char *argv[])
     // 设置绘制器的属性
     g_object_set(G_OBJECT(osd), "process-mode", MODE_GPU, "qos", 0, NULL);
 
+    // 添加元素到管道中并连接数据源和streammux
+#if CAPTURE_MODE
+    gst_bin_add_many(GST_BIN(pipeline), source, decoder, streammux, pgie, tracker, nvvidconv, osd, NULL);
+    if (!gst_element_link_many(source, decoder, NULL))
+    {
+        g_printerr("Failed to link source and decoder\n");
+        return -1;
+    }
+    // 链接decoder和streammux
+    g_signal_connect(decoder, "pad-added", G_CALLBACK(pad_added_handler), streammux);
+#else
+    gst_bin_add_many(GST_BIN(pipeline), source, v4l2caps, v4l2bayerconv, v4l2nvvidconv, streammux, pgie, tracker, nvvidconv, osd, NULL);
+    // 链接source、v4l2caps、v4l2bayerconv和v4l2nvvidconv
+
+    if (!gst_element_link_many(source, v4l2caps, v4l2bayerconv, v4l2nvvidconv, NULL))
+    {
+        g_printerr("Failed to link source and decoder\n");
+        return -1;
+    }
+    // 链接元素streammux和v4l2nvvidconv
+    GstPad *source_src_pad = gst_element_get_static_pad(v4l2nvvidconv, "src");
+    GstPad *streammux_sink_pad = gst_element_get_request_pad(streammux, "sink_0");
+    if (gst_pad_link(source_src_pad, streammux_sink_pad) != GST_PAD_LINK_OK)
+    {
+        g_printerr("Failed to link decoder and streammux\n");
+        return -1;
+    }
+    gst_object_unref(source_src_pad);
+    gst_object_unref(streammux_sink_pad);
+#endif
+
+    // 链接元素
+    if (!gst_element_link_many(streammux, pgie, tracker, nvvidconv, osd, NULL))
+    {
+        g_printerr("Failed to link streammux and other elements\n");
+        return -1;
+    }
+
+#if VIDEO_SAVE_MODE
+    std::string mp4_filename = getCurrentTimeFilename(".mp4");
     // encoder编码器
     // encoder用于将视频流编码为适合存储的格式
     GstElement *encoder = gst_element_factory_make("nvv4l2h264enc", "h264-encoder");
@@ -458,47 +540,51 @@ int main(int argc, char *argv[])
 
     // sink元素
     // sink元素用于将视频流输出到屏幕或文件
-    GstElement *sink = gst_element_factory_make(DISPLAY_SINK, "nvvideo-renderer");
+    GstElement *sink = gst_element_factory_make("filesink", "nvvideo-renderer");
+    if (!sink)
+    {
+        g_printerr("Failed to create sink element\n");
+        return -1;
+    }
+    // filesink用于将视频流输出到文件
+    g_object_set(G_OBJECT(sink), "location", mp4_filename.c_str(), NULL);
+
+    // 添加视频保存元素
+    gst_bin_add_many(GST_BIN(pipeline), encoder, h264parse, mp4mux, sink, NULL);
+
+    // 链接元素元素
+    if (!gst_element_link_many(osd, encoder, h264parse, mp4mux, sink, NULL))
+    {
+        g_printerr("Failed to link streammux and other elements\n");
+        return -1;
+    }
+#else
+    // sink元素
+    // sink元素用于将视频流输出到屏幕或文件
+    GstElement *sink = gst_element_factory_make(VIDEO_SAVE_MODE ? "fakesink" : "nv3dsink",
+                                                "nvvideo-renderer");
     if (!sink)
     {
         g_printerr("Failed to create sink element\n");
         return -1;
     }
     // 设置sink元素的属性
-    // // nv3dsink用于将视频流输出到屏幕
-    // g_object_set(G_OBJECT(sink), "async", 0, "sync", 0, "qos", 0, NULL);
-    // filesink用于将视频流输出到文件
-    g_object_set(G_OBJECT(sink), "location", mp4_filename.c_str(), NULL);
+    g_object_set(G_OBJECT(sink), "async", 0, "sync", 0, "qos", 0, NULL);
 
-    // 将所有元素添加到管道中
-    gst_bin_add_many(GST_BIN(pipeline), source, decoder, streammux, pgie, tracker, nvvidconv, osd, encoder, h264parse, mp4mux, sink, NULL);
-
-    // 链接元素streammux前置元素
-    if (!gst_element_link_many(source, decoder, NULL))
+    // 添加sink元素到管道中
+    if (!gst_bin_add(GST_BIN(pipeline), sink))
     {
-        g_printerr("Failed to link source  and decode\n");
+        g_printerr("Failed to add sink element to pipeline\n");
+        return -1;
+    }
+    // 链接元素
+    if (!gst_element_link(osd, sink))
+    {
+        g_printerr("Failed to link osd and sink\n");
         return -1;
     }
 
-    // 链接元素streammux和decoder
-    // GstPad *decoder_src_pad = gst_element_get_static_pad(decoder, "src");
-    // GstPad *streammux_sink_pad = gst_element_get_request_pad(streammux, "sink_0");
-    // if (gst_pad_link(decoder_src_pad, streammux_sink_pad) != GST_PAD_LINK_OK)
-    // {
-    //     g_printerr("Failed to link decoder and streammux\n");
-    //     return -1;
-    // }
-    // gst_object_unref(decoder_src_pad);
-    // gst_object_unref(streammux_sink_pad);
-
-    g_signal_connect(decoder, "pad-added", G_CALLBACK(pad_added_handler), streammux);
-
-    // 链接元素streammux和后续元素
-    if (!gst_element_link_many(streammux, pgie, tracker, nvvidconv, osd, encoder, h264parse, mp4mux, sink, NULL))
-    {
-        g_printerr("Failed to link streammux and other elements\n");
-        return -1;
-    }
+#endif
 
     // 添加消息处理器
     GstBus *bus = gst_element_get_bus(pipeline);
