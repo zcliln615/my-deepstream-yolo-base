@@ -10,8 +10,6 @@
 #include <sstream>
 #include <ctime>
 
-
-
 #include "perf.h"
 
 #define VIDEO_PATH "/home/lin/DeepStream-Yolo-Pose/bodypose.mp4"
@@ -21,8 +19,8 @@
 #define SET_WIDTH 1920
 #define SET_HEIGHT 1080
 #define STREAMMUX_TIMEOUT 16000
-#define CAPTURE_MODE 1    // 1: 文件读取视频；0: 摄像头读取视频
-#define VIDEO_SAVE_MODE 1 // 0: 不保存视频,实时演示；1: 保存视频，不实时演示
+#define CAPTURE_MODE 0    // 1: 文件读取视频；0: 摄像头读取视频
+#define VIDEO_SAVE_MODE 0 // 0: 不保存视频,实时演示；1: 保存视频，不实时演示
 
 const gint skeleton[][2] = {{16, 14}, {14, 12}, {17, 15}, {15, 13}, {12, 13}, {6, 12}, {7, 13}, {6, 7}, {6, 8}, {7, 9}, {8, 10}, {9, 11}, {2, 3}, {1, 2}, {1, 3}, {2, 4}, {3, 5}, {4, 6}, {5, 7}};
 
@@ -43,6 +41,7 @@ bus_call(GstBus *bus, GstMessage *msg, gpointer user_data)
         gst_element_get_state(GST_ELEMENT(GST_MESSAGE_SRC(msg)), &state, &pending, GST_CLOCK_TIME_NONE);
 
         g_print("Pipeline processing complete. Exiting...\n");
+
         g_main_loop_quit(loop);
         break;
     }
@@ -78,7 +77,7 @@ static gboolean key_event(GIOChannel *source, GIOCondition condition, gpointer d
 {
     GMainLoop *loop = (GMainLoop *)data;
     g_main_loop_quit(loop);
-    return TRUE;
+    return FALSE; // 返回FALSE以移除事件监听,避免重复触发
 }
 
 // 时间命名函数
@@ -368,35 +367,31 @@ int main(int argc, char *argv[])
     }
 #else
     // 创建管道元素
-    // v4l2src读取摄像头
-    GstElement *source = gst_element_factory_make("v4l2src", "camera-source");
+    // 读取csi摄像头
+    GstElement *source = gst_element_factory_make("nvarguscamerasrc", "camera-source");
     if (!source)
     {
         g_printerr("Failed to create source element\n");
         return -1;
     }
 
-    // 设置摄像头路径
-    g_object_set(G_OBJECT(source), "device", "/dev/video0", NULL);
+    // 设置摄像头参数(单摄像机时自行查找)
+    g_object_set(G_OBJECT(source),
+                 "sensor-id", 0, // 摄像头ID
+                 "sensor-mode", 2,// 1为图像采集，2为视频采集
+                 NULL);
 
     // 设置摄像头参数
-    GstElement *v4l2caps = gst_element_factory_make("capsfilter", "v4l2capsfilter");
+    GstElement *csicaps = gst_element_factory_make("capsfilter", "csicapsfilter");
 
     // 修改caps为摄像头原生RG10格式
-    GstCaps *caps = gst_caps_new_simple("video/x-bayer",
-                                         "format", G_TYPE_STRING, "rgrg",
-                                         "width", G_TYPE_INT, 1920,
-                                         "height", G_TYPE_INT, 1080,
-                                         "framerate", GST_TYPE_FRACTION, 30, 1,
-                                         NULL);
-    g_object_set(G_OBJECT(v4l2caps), "caps", caps, NULL);
+    GstCaps *caps = gst_caps_new_simple("video/x-raw(memory:NVMM)",
+                                        "width", G_TYPE_INT, SET_WIDTH,
+                                        "height", G_TYPE_INT, SET_HEIGHT,
+                                        "framerate", GST_TYPE_FRACTION, 30, 1,
+                                        NULL);
+    g_object_set(G_OBJECT(csicaps), "caps", caps, NULL);
     gst_caps_unref(caps);
-
-    // 添加RG10到RGB转换器
-    GstElement *v4l2bayerconv = gst_element_factory_make("bayer2rgb", "v4l2bayerconv");
-
-    // 添加nvvidconv转换器
-    GstElement *v4l2nvvidconv = gst_element_factory_make("nvvidconv", "v4l2nvvidconv");
 
 #endif
 
@@ -481,16 +476,16 @@ int main(int argc, char *argv[])
     // 链接decoder和streammux
     g_signal_connect(decoder, "pad-added", G_CALLBACK(pad_added_handler), streammux);
 #else
-    gst_bin_add_many(GST_BIN(pipeline), source, v4l2caps, v4l2bayerconv, v4l2nvvidconv, streammux, pgie, tracker, nvvidconv, osd, NULL);
-    // 链接source、v4l2caps、v4l2bayerconv和v4l2nvvidconv
+    gst_bin_add_many(GST_BIN(pipeline), source, csicaps, streammux, pgie, tracker, nvvidconv, osd, NULL);
+    // 链接source、csicaps、csibayerconv和csinvvidconv
 
-    if (!gst_element_link_many(source, v4l2caps, v4l2bayerconv, v4l2nvvidconv, NULL))
+    if (!gst_element_link(source, csicaps))
     {
-        g_printerr("Failed to link source and decoder\n");
+        g_printerr("Failed to link source and caps\n");
         return -1;
     }
-    // 链接元素streammux和v4l2nvvidconv
-    GstPad *source_src_pad = gst_element_get_static_pad(v4l2nvvidconv, "src");
+    // 链接元素streammux和csinvvidconv
+    GstPad *source_src_pad = gst_element_get_static_pad(csicaps, "src");
     GstPad *streammux_sink_pad = gst_element_get_request_pad(streammux, "sink_0");
     if (gst_pad_link(source_src_pad, streammux_sink_pad) != GST_PAD_LINK_OK)
     {
@@ -519,7 +514,11 @@ int main(int argc, char *argv[])
         return -1;
     }
     // 设置编码器的属性
-    g_object_set(G_OBJECT(encoder), "bitrate", 4000000, "preset-level", 1, NULL);
+    // 设置编码器的属性，包含更多必要的参数
+    g_object_set(G_OBJECT(encoder),
+                 "bitrate", 4000000,
+                 "preset-level", 1,
+                 NULL);
 
     // 添加 h264parse 解析器
     GstElement *h264parse = gst_element_factory_make("h264parse", "h264-parser");
@@ -531,12 +530,19 @@ int main(int argc, char *argv[])
 
     // mp4mux封装器
     // mp4mux用于将编码后的视频流封装为MP4格式
-    GstElement *mp4mux = gst_element_factory_make("mp4mux", "mp4-muxer");
-    if (!mp4mux)
+    GstElement *qtmux = gst_element_factory_make("qtmux", "mp4-muxer");
+    if (!qtmux)
     {
-        g_printerr("Failed to create mp4mux element\n");
+        g_printerr("Failed to create qtmux element\n");
         return -1;
     }
+
+    // 设置mp4mux属性
+    g_object_set(G_OBJECT(qtmux),
+                 "fragment-duration", 0, // 不分割片段
+                 "streamable", FALSE,    // 确保完整文件结构
+                 "faststart", TRUE,      // 允许快速播放
+                 NULL);
 
     // sink元素
     // sink元素用于将视频流输出到屏幕或文件
@@ -550,10 +556,10 @@ int main(int argc, char *argv[])
     g_object_set(G_OBJECT(sink), "location", mp4_filename.c_str(), NULL);
 
     // 添加视频保存元素
-    gst_bin_add_many(GST_BIN(pipeline), encoder, h264parse, mp4mux, sink, NULL);
+    gst_bin_add_many(GST_BIN(pipeline), encoder, h264parse, qtmux, sink, NULL);
 
     // 链接元素元素
-    if (!gst_element_link_many(osd, encoder, h264parse, mp4mux, sink, NULL))
+    if (!gst_element_link_many(osd, encoder, h264parse, qtmux, sink, NULL))
     {
         g_printerr("Failed to link streammux and other elements\n");
         return -1;
@@ -618,6 +624,7 @@ int main(int argc, char *argv[])
     gst_object_unref(converter_sink_pad);
 
     // 启动管道
+
     gst_element_set_state(pipeline, GST_STATE_PAUSED);
 
     if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
@@ -640,6 +647,7 @@ int main(int argc, char *argv[])
     g_print("Stopping...\n");
     gst_element_set_state(pipeline, GST_STATE_NULL);
     gst_object_unref(pipeline);
+    g_source_remove(bus_watch_id);
     g_main_loop_unref(loop);
 
     return 0;
